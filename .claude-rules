@@ -1,0 +1,352 @@
+# TP Opportunity Finder - Claude Code Rules
+
+## Project Overview
+
+This is a web application for identifying transfer pricing opportunities from Luxembourg company annual accounts. It uses a strict two-layer architecture to prevent AI hallucination of financial data.
+
+## Critical Architecture Rule
+
+```
+PDF → Google Drive → Document AI → Structured JSON → Database → Claude API → Analysis
+                                          ↑
+                                    HARD BOUNDARY
+                                          ↓
+                     Claude ONLY receives structured JSON
+                     Claude NEVER sees PDF, images, or raw text
+```
+
+**This rule is non-negotiable.** The analysis layer must only receive the structured extraction JSON from the database. It must never process PDFs directly.
+
+## Technology Stack
+
+- **Frontend**: Next.js 14 (App Router)
+- **PDF Storage**: Google Drive (user's premium account)
+- **Extraction**: Google Document AI (Layout Parser)
+- **Database**: Supabase (PostgreSQL)
+- **Analysis**: Claude API (Anthropic)
+- **Hosting**: Vercel (free tier)
+
+## Key Documentation
+
+Before implementing any feature, read:
+1. `docs/PROJECT_STRUCTURE.md` - Complete architecture, folder structure, database schema, types
+2. `docs/IMPLEMENTATION_GUIDE.md` - Step-by-step implementation prompts
+
+## Implementation Principles
+
+1. **Type Safety**: Use TypeScript strictly. No `any` types. All data structures must match the types defined in `src/lib/types/`.
+
+2. **Data Flow Separation**: 
+   - Upload routes → Google Drive only
+   - Extract routes → Document AI only, stores JSON in database
+   - Analyze routes → Reads JSON from database, sends to Claude API
+   - Analysis must NEVER access PDFs
+
+3. **Source Traceability**: Every extracted value must include page number, source reference, and eCDF/PCN code where applicable.
+
+4. **Error Handling**: All API routes must handle errors gracefully with appropriate HTTP status codes and descriptive messages.
+
+5. **Luxembourg GAAP Compliance**: 
+   - Use official eCDF/PCN codes as data anchors
+   - Handle both French and English terminology
+   - Detect abridged vs full accounts
+   - Determine company size from Art. 35 thresholds
+   - Extract mandatory disclosures (Note 7ter, Note 20, Note 22)
+
+6. **Validation Checks**:
+   - Arithmetic: Assets = Equity + Liabilities
+   - Note reconciliation: Note totals must match BS/PL line items
+   - IC consistency: IC loans should have corresponding IC interest
+   - IC Alignment: Interest Income must exist alongside IC Receivables
+   - Mandatory disclosures: Flag missing disclosures based on company size
+   - KPI vs canonical: KPI values must equal sum of canonical lines
+
+7. **CRITICAL: Unit/Scale Detection**
+   - FIRST action in extraction: detect presentation scale (units/thousands/millions)
+   - Cross-validate magnitudes make sense
+   - If uncertain, flag unit_scale_uncertain = true
+
+8. **CRITICAL: Deterministic Metrics**
+   - ALL arithmetic calculations happen in parser, NOT in Claude
+   - Claude receives pre-computed metrics and must use them
+   - Claude must NEVER estimate or infer missing amounts
+   - Track metrics_not_calculable with reasons
+   - Benchmark parameters are HEURISTICS - label them clearly
+
+9. **Explicit Status Modeling**
+   - Every field has status: extracted | not_found | not_disclosed | aggregated
+   - "not_disclosed" ≠ "zero" (legal exemption vs actual zero)
+   - "aggregated" = value hidden in abridged accounts
+
+10. **Schema Versioning**
+    - extraction_schema_version in every extraction
+    - CODE_DICTIONARY_VERSION for caption-to-code mapping
+    - Validate JSON at write-time
+    - Reject invalid payloads to prevent drift
+
+11. **CRITICAL: PCN Code Dominance**
+    - Layout Parser struggles with labels (templates differ by firm)
+    - Luxembourg filings have "Reference" column with 4-digit PCN codes
+    - ALWAYS extract from Reference column FIRST - most reliable anchors
+    - Fall back to caption matching only when Reference column absent
+    - Track match_source: 'reference_column' vs 'caption_match'
+
+12. **CRITICAL: Pre-Analysis Gates**
+    - MUST-PASS gates (block analysis): unit_scale_validated, balance_sheet_balances
+    - SHOULD-PASS gates (warn): mapping_quality, ic_consistency
+    - Check can_proceed_to_analysis before allowing analysis
+
+13. **Note 7ter Interpretation**
+    - "No Note 7ter" ≠ "No IC transactions"
+    - Note 7ter only discloses transactions NOT at arm's length
+    - Set ic_disclosure_limitation flag appropriately
+
+14. **CRITICAL: SOPARFI/Substance Detection**
+    - Many Luxembourg entities are SOPARFIs (Holding/Financing)
+    - Pattern: High IC debt (4279) + zero/low staff costs = Substance Risk
+    - Pattern: High participations (1151) + no employees = Holding concern
+    - Check Circular 56/1 compliance
+    - Flag these as specific TP opportunities
+
+15. **Hierarchical Linked Schema**
+    - Don't treat Balance Sheet and Notes as isolated blocks
+    - Embed linked_note_data directly in CanonicalLineItem
+    - Link BS items to their Note breakdowns (counterparties, maturities)
+
+16. **Language Normalization**
+    - Map FR/DE labels to English TP standard terms
+    - Keep original PCN code as immutable key
+    - Store caption_original and caption_normalized
+
+17. **CRITICAL: PCN Code Citation Requirement**
+    - Every Claude opportunity MUST cite specific PCN codes
+    - Format: "Based on PCN 1171 (IC Receivables: €X)..."
+    - Responses without PCN citations are REJECTED
+    - This enables instant verification by TP professionals
+
+18. **Multi-Year/Trend Analysis**
+    - Extract CY and PY from comparative columns in same PDF
+    - Compute yoy_analysis for trend detection
+    - Flag significant volatility (>20% changes, >5pp margin shifts)
+    - TP opportunities are rarely found in a single year
+
+19. **Three-Module JSON Organization**
+    - MODULE A (Anchors): canonical statements, deterministic_metrics
+    - MODULE B (Context): extracted_notes, ic_transactions, related_party_transactions
+    - MODULE C (Story): management_report, far_context, qualitative_context
+
+20. **CRITICAL: Abridged Account Handling**
+    - If is_abridged_pnl = true, DO NOT calculate:
+      * Net Margin, COGS-based metrics, Operating margin
+      * Gross Result ≠ Turnover for TP benchmarking
+    - INSTEAD focus on: IC financing spreads, debt/equity, substance
+
+21. **CRITICAL: Mapping Gate (Main Vulnerability)**
+    - Wrong-but-confident code assignment is the primary failure mode
+    - If requires_review_count > 0: force human review
+    - If high_confidence_mappings < 80%: block automated analysis
+    - Mapping dictionary is a MAINTAINED ARTIFACT (versioned, updated)
+
+22. **CRITICAL: Consolidation Decision Rules**
+    - is_consolidated = true triggers DIFFERENT analysis path:
+      * analysis_mode = 'group_level_only' (IC may be eliminated)
+      * Entity-level TP conclusions are BLOCKED (misleading)
+    - is_consolidated = false: full entity-level analysis allowed
+    - Must derive standalone_tp_analyzable from multiple signals
+
+23. **JSON ↔ Tables Reconciliation**
+    - IC/related party transactions stored in BOTH JSON and DB tables
+    - Each record has record_id (deterministic hash) and record_fingerprint
+    - Write via single deterministic transformer
+    - Validate round-trip equality before marking approved
+
+24. **Note 7ter Semantic Enforcement**
+    - "No 7ter entries" ≠ "All IC is arm's length"
+    - Note 7ter ONLY shows transactions NOT at market terms
+    - Analysis must NEVER misread absence as confirmation
+
+25. **CRITICAL: Analysis Readiness Levels (Prevents Endless Review)**
+    - READY_FULL: All gates pass, mapping ≥80%, full analysis
+    - READY_LIMITED: Unit scale + BS pass, mapping 60-80%, restricted analysis
+    - BLOCKED: Critical gates fail, no analysis allowed
+
+26. **Limited Mode Rules (READY_LIMITED)**
+    ALLOWED if conditions met:
+    - IC financing spreads (if IC amounts high-confidence)
+    - Substance flags (if employees/staff_costs high-confidence)
+    - Thin cap ratio (if debt/equity high-confidence)
+    
+    DISALLOWED:
+    - Operating PLIs / margin-based opportunities
+    - Service fee base erosion
+    - Cost-plus benchmarking
+    - Any abridged P&L-based opportunities
+
+27. **Template Fingerprint Caching**
+    - Hash of layout + language + audit firm template
+    - If previously approved: auto-boost confidence by 10%
+    - Reduces review volume over time
+
+28. **Golden Corpus Regression**
+    - 20-30 representative Lux filings (full, abridged, scanned)
+    - Dictionary/mapping updates must pass regression
+    - Block if confidence drops or gates regress
+
+29. **CRITICAL: Materiality-Based Mapping Gate**
+    - Only force review if TP_CRITICAL_PCN_CODES affected
+    - Non-critical low-confidence codes: allow LIMITED with warning
+    - Prevents review inflation while protecting correctness
+    
+    TP-Critical codes include: 1171, 4279 (IC balances), 6311, 6511 (IC interest),
+    6412 (staff costs), 1010/1110/1310 (equity for thin cap)
+
+30. **Related Party Boolean Semantics**
+    - DO NOT use: is_arms_length: boolean (default TRUE creates false negatives)
+    - USE: disclosure_type + non_market_terms_disclosed (explicit, no default)
+    - Note 7ter rows are explicitly non-market terms
+
+31. **Fingerprint Governance**
+    - Approved fingerprints expire after 12 months
+    - Dictionary version change triggers requires_revalidation
+    - Support revocation with reason
+    - Prevents systematic error propagation
+
+32. **Consolidation One-Step Resolution**
+    - If consolidation unclear: exactly ONE ReviewAction (confirm_consolidation)
+    - After user confirms: store resolution, never ask again for company/year
+    - Prevents recurring blocker
+
+33. **Safe Automation Rule**
+    - READY_FULL requires: mapping quality ≥80% AND no unresolved arithmetic errors
+    - READY_LIMITED allowed when errors don't affect TP-critical bases
+    - JSON↔tables reconciliation must pass before "approved" status
+
+## FINAL OPERATIONAL PRINCIPLES (Non-Negotiable)
+
+34. **READY_LIMITED is a Hard Product Mode**
+    - Opportunity generation MECHANICALLY depends on: readiness + *_calculable + trust levels
+    - Code BLOCKS disabled opportunity types (not prompt "please be careful")
+    - If abridged → operating PLIs and service fee base logic disabled BY DESIGN
+
+35. **Defaults Must Never Imply Compliance**
+    - Use NULL/unknown for compliance-relevant fields (no dangerous defaults)
+    - Force explicit population by transformer
+    - Block analysis if compliance-relevant field not explicitly set
+
+36. **Fingerprint Trust But Verify**
+    - Spot-check rate: 1 in 20 uploads per approved fingerprint
+    - Auto-revoke if spot_check_failures > 3
+    - Dictionary version change → auto-downgrade until revalidated
+
+37. **Review Loop Strictly Bounded**
+    - ONLY 4 action types: confirm_unit_scale, confirm_mapping, confirm_consolidation, fix_arithmetic
+    - Max 5-10 actions per extraction
+    - Anything else → warning + LIMITED mode (NOT a blocker)
+
+38. **Idempotent Transformer + Round-Trip Equality**
+    - Same JSON always produces same table rows
+    - "Approved" status REQUIRES passing reconciliation check
+    - If reconciliation fails → stays in pending_reconciliation state
+
+## JSON Structure Example (Semantic Anchoring)
+
+```json
+{
+  "pcn_1171": {
+    "value": 881583087.98,
+    "note_link": "Note 5",
+    "caption_metadata": {
+      "original": "Créances sur des entreprises liées",
+      "normalized": "Amounts owed by affiliated undertakings",
+      "language": "FR"
+    },
+    "linked_note_data": {
+      "note_number": "5",
+      "counterparties": [
+        {"name": "Parent Co SA", "amount": 500000000, "transaction_type": "cash_pooling"},
+        {"name": "Sister Co BV", "amount": 381583087.98, "transaction_type": "accrued_interest"}
+      ]
+    }
+  }
+}
+```
+
+## Implementation Priorities
+
+| Priority | Action | Reason |
+|----------|--------|--------|
+| CRITICAL | PCN Mapping Logic | Eliminates label-translation errors |
+| CRITICAL | Scale Validation | Prevents 1,000x magnitude errors |
+| HIGH | Note 7ter Module | Captures non-market IC deals |
+| HIGH | Management Report Scraper | Provides "Risk" context for FAR |
+| HIGH | Note-to-Line Semantic Anchoring | Links BS totals to TP-relevant detail |
+| MEDIUM | Keyword Scoring | Extracts qualitative FAR context |
+
+## Luxembourg GAAP Key References
+
+**eCDF Codes to Extract (Priority):**
+- 1171: Créances sur entreprises liées (IC loans granted - fixed)
+- 1279: Créances sur entreprises liées (IC receivables - current)
+- 4279: Dettes envers entreprises liées (IC loans received)
+- 6251a: Produits de participations - entreprises liées (IC dividends)
+- 6261a/6271a: Interest income from affiliated
+- 6311a: Interest expense to affiliated
+
+**Critical Notes:**
+- Note 1: Ownership and group structure
+- Note 7ter: Related party transactions NOT at arm's length (Art. 65(1) 7ter)
+- Note 20: Creditors maturity analysis
+- Note 22: Turnover breakdown (mandatory for large companies)
+
+**Company Size Thresholds (Art. 35):**
+- Small: BS ≤ €4.4M, Turnover ≤ €8.8M, Employees ≤ 50
+- Medium: BS ≤ €20M, Turnover ≤ €40M, Employees ≤ 250
+- Large: exceeds medium thresholds
+- Must exceed 2 of 3 thresholds to move to next category
+
+**Abridged Accounts:**
+- Small/medium companies can file abridged P&L starting at "Gross Result"
+- When detected, flag that margin analysis is limited
+- Extract what's available, clearly mark limitations
+
+## Folder Structure
+
+```
+src/
+├── app/                    # Next.js App Router pages and API routes
+├── lib/                    # Utilities, clients, parsers, types
+└── components/             # React components organized by feature
+```
+
+## Database Tables
+
+**Note:** This project reuses the existing Supabase project from the old TP Opportunity Finder. The schema has been migrated to the new structure.
+
+- `companies` - Company master data with Google Drive folder reference
+- `financial_years` - PDF references and extraction data (JSONB)
+- `tp_analyses` - Analysis results from Claude
+- `ic_transactions` - Extracted IC transactions
+- `opportunity_pipeline` - CRM-style pipeline tracking
+
+## Environment Variables Required
+
+- Supabase: URL, anon key, service role key
+- Google: project ID, location, processor ID, credentials JSON
+- Google Drive: root folder ID, companies folder ID
+- Anthropic: API key
+
+## Code Style
+
+- Use functional components with hooks
+- Use Tailwind CSS for styling
+- Prefer async/await over .then()
+- Use descriptive variable and function names
+- Add comments for complex logic
+
+## When Implementing Features
+
+1. Check PROJECT_STRUCTURE.md for the correct file location
+2. Check type definitions before creating new types
+3. Follow the existing patterns in the codebase
+4. Test API routes with proper error cases
+5. Ensure UI has loading and error states
