@@ -248,6 +248,9 @@ async function main(): Promise<void> {
   logQuality('Azure', azureQuality);
 
   logDelta(googleQuality, azureQuality);
+
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  process.exit(0);
 }
 
 main().catch((error) => {

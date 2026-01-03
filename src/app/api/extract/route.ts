@@ -179,6 +179,7 @@ export async function POST(request: NextRequest): Promise<NextResponse<ExtractRe
     }
 
     let extractionQuality = buildExtractionQuality(documentAIResult);
+    const googleQuality = extractionQuality;
     console.log('[Extract] Extraction quality (initial):', {
       pages: extractionQuality.pages,
       tables: extractionQuality.tables,
@@ -193,15 +194,24 @@ export async function POST(request: NextRequest): Promise<NextResponse<ExtractRe
           console.warn(`[Extract] Document AI quality below threshold (${reasonSummary}). Trying Azure fallback...`);
           try {
             const azureResult = await processDocumentWithAzure(pdfBuffer, { timeoutMs: 300000 });
-            documentAIResult = azureResult;
-            extractionProvider = 'azure';
-            extractionQuality = buildExtractionQuality(documentAIResult);
-            fallbackWarnings.push(`Used Azure fallback due to: ${reasonSummary}`);
-            console.log('[Extract] Extraction quality (Azure fallback):', {
-              pages: extractionQuality.pages,
-              tables: extractionQuality.tables,
-              pcn_codes_found: extractionQuality.pcn_codes_found,
-            });
+            const azureQuality = buildExtractionQuality(azureResult);
+            const acceptance = shouldAcceptAzureFallback(googleQuality, azureQuality);
+
+            if (acceptance.accept) {
+              documentAIResult = azureResult;
+              extractionProvider = 'azure';
+              extractionQuality = azureQuality;
+              fallbackWarnings.push(`Used Azure fallback due to: ${reasonSummary}`);
+              console.log('[Extract] Extraction quality (Azure fallback):', {
+                pages: extractionQuality.pages,
+                tables: extractionQuality.tables,
+                pcn_codes_found: extractionQuality.pcn_codes_found,
+              });
+            } else {
+              const rejectSummary = acceptance.reasons.join('; ');
+              console.warn(`[Extract] Azure fallback rejected: ${rejectSummary}`);
+              fallbackWarnings.push(`Azure fallback rejected: ${rejectSummary}`);
+            }
           } catch (azureError) {
             const azureMessage = azureError instanceof Error ? azureError.message : 'Azure processing failed';
             console.warn('[Extract] Azure fallback failed, keeping Document AI result:', azureMessage);
@@ -472,6 +482,36 @@ function shouldFallbackToAzure(quality: {
 
   return {
     shouldFallback: reasons.length > 0,
+    reasons,
+  };
+}
+
+function shouldAcceptAzureFallback(
+  google: { pages: number; text_length: number; tables: number },
+  azure: { pages: number; text_length: number; tables: number }
+): {
+  accept: boolean;
+  reasons: string[];
+} {
+  const reasons: string[] = [];
+
+  const minPageCoverage = google.pages === 0 ? 1 : Math.ceil(google.pages * 0.8);
+  const minTextCoverage = google.text_length === 0 ? 1 : Math.ceil(google.text_length * 0.6);
+
+  const pageCoverageOk = azure.pages >= minPageCoverage;
+  const textCoverageOk = azure.text_length >= minTextCoverage;
+  const tableImproved = azure.tables > google.tables;
+
+  if (!pageCoverageOk) {
+    reasons.push(`Azure pages ${azure.pages} < ${minPageCoverage} (80% of Google)`);
+  }
+
+  if (pageCoverageOk && !(textCoverageOk || tableImproved)) {
+    reasons.push(`Azure content coverage too low (${azure.text_length} chars)`);
+  }
+
+  return {
+    accept: pageCoverageOk && (textCoverageOk || tableImproved),
     reasons,
   };
 }
