@@ -4,7 +4,7 @@
 
 import { DocumentProcessorServiceClient } from '@google-cloud/documentai';
 import { Storage } from '@google-cloud/storage';
-import { getCredentials } from './auth';
+import { getCredentials } from './auth.ts';
 import crypto from 'crypto';
 
 // Document AI types
@@ -100,11 +100,13 @@ function getClient(): DocumentProcessorServiceClient {
 
 /**
  * Get the processor name (full resource path)
+ * Supports both DOCUMENT_AI_PROCESSOR_ID (documented) and GOOGLE_DOCUMENT_AI_PROCESSOR_ID (legacy)
  */
 function getProcessorName(): string {
   const projectId = process.env.GOOGLE_CLOUD_PROJECT_ID;
   const location = process.env.GOOGLE_CLOUD_LOCATION;
-  const processorId = process.env.GOOGLE_DOCUMENT_AI_PROCESSOR_ID;
+  // Support documented env var with fallback to alternative naming
+  const processorId = process.env.DOCUMENT_AI_PROCESSOR_ID || process.env.GOOGLE_DOCUMENT_AI_PROCESSOR_ID;
 
   if (!projectId) {
     throw new Error('GOOGLE_CLOUD_PROJECT_ID environment variable is not set');
@@ -115,7 +117,7 @@ function getProcessorName(): string {
   }
 
   if (!processorId) {
-    throw new Error('GOOGLE_DOCUMENT_AI_PROCESSOR_ID environment variable is not set');
+    throw new Error('DOCUMENT_AI_PROCESSOR_ID environment variable is not set');
   }
 
   return `projects/${projectId}/locations/${location}/processors/${processorId}`;
@@ -139,6 +141,66 @@ function getStorageClient(): Storage {
   });
 
   return storageInstance;
+}
+
+function shiftTextAnchorSegments(
+  textSegments: Array<{ startIndex?: string | number; endIndex?: string | number }>,
+  offset: number
+): void {
+  for (const segment of textSegments) {
+    if (segment.startIndex !== undefined) {
+      segment.startIndex = Number(segment.startIndex) + offset;
+    }
+    if (segment.endIndex !== undefined) {
+      segment.endIndex = Number(segment.endIndex) + offset;
+    }
+  }
+}
+
+function shiftTextAnchorsInObject(node: unknown, offset: number): void {
+  if (!node || typeof node !== 'object') {
+    return;
+  }
+
+  const obj = node as Record<string, unknown>;
+  const anchor = obj.textAnchor as { textSegments?: Array<{ startIndex?: string | number; endIndex?: string | number }> } | undefined;
+
+  if (anchor?.textSegments) {
+    shiftTextAnchorSegments(anchor.textSegments, offset);
+  }
+
+  for (const [key, value] of Object.entries(obj)) {
+    if (key === 'textAnchor') {
+      continue;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        shiftTextAnchorsInObject(item, offset);
+      }
+    } else if (value && typeof value === 'object') {
+      shiftTextAnchorsInObject(value, offset);
+    }
+  }
+}
+
+function shiftEntityPageRefs(entities: unknown[] | null | undefined, pageOffset: number): void {
+  if (!entities || pageOffset === 0) {
+    return;
+  }
+
+  for (const entity of entities) {
+    const typedEntity = entity as { pageAnchor?: { pageRefs?: Array<{ page?: number | string }> } };
+    const refs = typedEntity.pageAnchor?.pageRefs;
+    if (!refs) {
+      continue;
+    }
+
+    for (const ref of refs) {
+      if (ref.page !== undefined) {
+        ref.page = Number(ref.page) + pageOffset;
+      }
+    }
+  }
 }
 
 /**
@@ -253,7 +315,8 @@ async function processDocumentSync(
     throw new Error('Document AI returned no document');
   }
 
-  return parseDocumentResponse(result.document);
+  // Cast through unknown to handle SDK type differences (null vs undefined)
+  return parseDocumentResponse(result.document as unknown as Parameters<typeof parseDocumentResponse>[0]);
 }
 
 /**
@@ -354,24 +417,42 @@ async function processDocumentBatch(
     for (const jsonFile of jsonFiles) {
       const [outputContent] = await jsonFile.download();
       const shardJson = JSON.parse(outputContent.toString());
+      const shardDocument = (shardJson.document ?? shardJson) as {
+        text?: string;
+        pages?: unknown[];
+        entities?: Array<{
+          type?: string;
+          mentionText?: string;
+          confidence?: number;
+          pageAnchor?: { pageRefs?: Array<{ page?: number | string }> };
+        }>;
+      };
 
-      // Append text (with offset tracking for text anchors)
+      const shardText = typeof shardDocument.text === 'string' ? shardDocument.text : '';
       const textOffset = mergedText.length;
-      if (shardJson.text) {
-        mergedText += shardJson.text;
+      const pageOffset = mergedPages.length;
+
+      if (textOffset > 0 && shardText.length > 0) {
+        shiftTextAnchorsInObject(shardDocument, textOffset);
       }
 
-      // Add pages
-      if (shardJson.pages && Array.isArray(shardJson.pages)) {
-        mergedPages.push(...shardJson.pages);
+      if (pageOffset > 0) {
+        shiftEntityPageRefs(shardDocument.entities, pageOffset);
       }
 
-      // Add entities (adjusting text anchors if needed)
-      if (shardJson.entities && Array.isArray(shardJson.entities)) {
-        mergedEntities.push(...shardJson.entities);
+      if (shardText) {
+        mergedText += shardText;
       }
 
-      console.log(`[Document AI] Shard ${jsonFile.name}: ${shardJson.pages?.length || 0} pages`);
+      if (shardDocument.pages && Array.isArray(shardDocument.pages)) {
+        mergedPages.push(...shardDocument.pages);
+      }
+
+      if (shardDocument.entities && Array.isArray(shardDocument.entities)) {
+        mergedEntities.push(...shardDocument.entities);
+      }
+
+      console.log(`[Document AI] Shard ${jsonFile.name}: ${shardDocument.pages?.length || 0} pages`);
     }
 
     const outputJson = {
@@ -410,8 +491,8 @@ async function processDocumentBatch(
  * Parse Document AI response into our format
  */
 function parseDocumentResponse(document: {
-  text?: string;
-  pages?: unknown[];
+  text?: string | null;
+  pages?: unknown[] | null;
   entities?: Array<{
     type?: string;
     mentionText?: string;
@@ -419,7 +500,7 @@ function parseDocumentResponse(document: {
     pageAnchor?: {
       pageRefs?: Array<{ page?: number | string }>;
     };
-  }>;
+  }> | null;
 }): DocumentAIResult {
   // Extract full text
   const text = document.text || '';
@@ -608,7 +689,7 @@ export function getDocumentAIConfig(): {
 } {
   const projectId = process.env.GOOGLE_CLOUD_PROJECT_ID || '';
   const location = process.env.GOOGLE_CLOUD_LOCATION || '';
-  const processorId = process.env.GOOGLE_DOCUMENT_AI_PROCESSOR_ID || '';
+  const processorId = process.env.DOCUMENT_AI_PROCESSOR_ID || process.env.GOOGLE_DOCUMENT_AI_PROCESSOR_ID || '';
 
   return {
     projectId,

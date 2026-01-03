@@ -9,7 +9,8 @@
     "lint": "next lint",
     "test:google": "ts-node --esm scripts/test-google-connection.ts",
     "test:supabase": "ts-node --esm scripts/test-supabase-connection.ts",
-    "test:connections": "npm run test:google && npm run test:supabase"
+    "test:connections": "npm run test:google && npm run test:supabase",
+    "compare:document-intelligence": "ts-node --esm scripts/compare-document-intelligence.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.33.1",

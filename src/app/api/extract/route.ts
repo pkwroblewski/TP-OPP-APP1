@@ -4,8 +4,9 @@
 
 import { NextRequest, NextResponse } from 'next/server';
 import { createServiceClient } from '@/lib/supabase/server';
-import { downloadFile } from '@/lib/google/drive';
-import { processDocument } from '@/lib/google/document-ai';
+import { downloadFile, DriveError } from '@/lib/google/drive';
+import { processDocument, type DocumentAIResult } from '@/lib/google/document-ai';
+import { processDocumentWithAzure, isAzureConfigured } from '@/lib/azure/document-intelligence';
 import { parseDocument, EXTRACTION_SCHEMA_VERSION, type ParserStructuredExtraction } from '@/lib/parser';
 import crypto from 'crypto';
 
@@ -22,6 +23,16 @@ interface ExtractResponse {
     blocking_issues: string[];
     warning_issues: string[];
   };
+  extraction_quality?: {
+    pages: number;
+    text_length: number;
+    tables: number;
+    blocks: number;
+    paragraphs: number;
+    pcn_codes_found: number;
+    top_pcn_codes: Array<{ code: string; count: number }>;
+  };
+  extraction_provider?: 'google' | 'azure';
   can_proceed_to_analysis?: boolean;
   requires_human_review?: boolean;
   review_reason?: string;
@@ -99,16 +110,34 @@ export async function POST(request: NextRequest): Promise<NextResponse<ExtractRe
       console.log(`[Extract] PDF downloaded: ${pdfBuffer.length} bytes`);
     } catch (downloadError) {
       console.error('[Extract] PDF download failed:', downloadError);
-      await updateExtractionFailed(supabase, financialYearId, 'Failed to download PDF from Google Drive');
+
+      // Provide specific error messages for Drive permission issues
+      let errorMessage = 'Failed to download PDF from Google Drive';
+      let statusCode = 500;
+
+      if (downloadError instanceof DriveError) {
+        errorMessage = downloadError.message;
+        if (downloadError.isPermissionError) {
+          errorMessage = `Cannot access PDF file. The service account may not have read access. Please re-upload the file or share the folder with the service account. (File ID: ${financialYear.gdrive_pdf_file_id})`;
+          statusCode = 403;
+        } else if (downloadError.code === 'AUTH_FAILED') {
+          errorMessage = 'Google Drive authentication failed. Please check service account credentials.';
+          statusCode = 401;
+        }
+      }
+
+      await updateExtractionFailed(supabase, financialYearId, errorMessage);
       return NextResponse.json(
-        { success: false, error: 'Failed to download PDF from Google Drive' },
-        { status: 500 }
+        { success: false, error: errorMessage },
+        { status: statusCode }
       );
     }
 
     // 4. Send PDF to Document AI (supports Layout Parser or Document OCR)
     console.log('[Extract] Processing PDF with Document AI...');
-    let documentAIResult;
+    let documentAIResult: DocumentAIResult | null = null;
+    let extractionProvider: 'google' | 'azure' = 'google';
+    const fallbackWarnings: string[] = [];
     try {
       // Use 5 minute timeout for Document OCR which can handle large documents
       documentAIResult = await processDocument(pdfBuffer, { timeoutMs: 300000 });
@@ -116,11 +145,73 @@ export async function POST(request: NextRequest): Promise<NextResponse<ExtractRe
     } catch (docAIError) {
       const errorMessage = docAIError instanceof Error ? docAIError.message : 'Document AI processing failed';
       console.error('[Extract] Document AI processing failed:', errorMessage);
-      await updateExtractionFailed(supabase, financialYearId, errorMessage);
+
+      if (isAzureConfigured()) {
+        console.warn('[Extract] Falling back to Azure Document Intelligence after Document AI failure...');
+        try {
+          documentAIResult = await processDocumentWithAzure(pdfBuffer, { timeoutMs: 300000 });
+          extractionProvider = 'azure';
+          fallbackWarnings.push(`Document AI failed; used Azure fallback. Reason: ${errorMessage}`);
+        } catch (azureError) {
+          const azureMessage = azureError instanceof Error ? azureError.message : 'Azure processing failed';
+          console.error('[Extract] Azure fallback failed:', azureMessage);
+          await updateExtractionFailed(supabase, financialYearId, azureMessage);
+          return NextResponse.json(
+            { success: false, error: azureMessage },
+            { status: 500 }
+          );
+        }
+      } else {
+        await updateExtractionFailed(supabase, financialYearId, errorMessage);
+        return NextResponse.json(
+          { success: false, error: errorMessage },
+          { status: 500 }
+        );
+      }
+    }
+
+    if (!documentAIResult) {
+      await updateExtractionFailed(supabase, financialYearId, 'Extraction failed: no document result.');
       return NextResponse.json(
-        { success: false, error: errorMessage },
+        { success: false, error: 'Extraction failed: no document result.' },
         { status: 500 }
       );
+    }
+
+    let extractionQuality = buildExtractionQuality(documentAIResult);
+    console.log('[Extract] Extraction quality (initial):', {
+      pages: extractionQuality.pages,
+      tables: extractionQuality.tables,
+      pcn_codes_found: extractionQuality.pcn_codes_found,
+    });
+
+    if (extractionProvider === 'google') {
+      const fallbackDecision = shouldFallbackToAzure(extractionQuality);
+      if (fallbackDecision.shouldFallback) {
+        const reasonSummary = fallbackDecision.reasons.join('; ');
+        if (isAzureConfigured()) {
+          console.warn(`[Extract] Document AI quality below threshold (${reasonSummary}). Trying Azure fallback...`);
+          try {
+            const azureResult = await processDocumentWithAzure(pdfBuffer, { timeoutMs: 300000 });
+            documentAIResult = azureResult;
+            extractionProvider = 'azure';
+            extractionQuality = buildExtractionQuality(documentAIResult);
+            fallbackWarnings.push(`Used Azure fallback due to: ${reasonSummary}`);
+            console.log('[Extract] Extraction quality (Azure fallback):', {
+              pages: extractionQuality.pages,
+              tables: extractionQuality.tables,
+              pcn_codes_found: extractionQuality.pcn_codes_found,
+            });
+          } catch (azureError) {
+            const azureMessage = azureError instanceof Error ? azureError.message : 'Azure processing failed';
+            console.warn('[Extract] Azure fallback failed, keeping Document AI result:', azureMessage);
+            fallbackWarnings.push(`Azure fallback failed: ${azureMessage}`);
+          }
+        } else {
+          console.warn('[Extract] Azure fallback skipped (Azure not configured).');
+          fallbackWarnings.push(`Azure fallback skipped: ${reasonSummary}`);
+        }
+      }
     }
 
     // 5. Parse response using Luxembourg GAAP parser
@@ -139,6 +230,10 @@ export async function POST(request: NextRequest): Promise<NextResponse<ExtractRe
         { success: false, error: parseResult.error || 'Parsing failed' },
         { status: 500 }
       );
+    }
+
+    if (fallbackWarnings.length > 0) {
+      parseResult.warnings.push(...fallbackWarnings);
     }
 
     const extraction = parseResult.extraction;
@@ -276,6 +371,8 @@ export async function POST(request: NextRequest): Promise<NextResponse<ExtractRe
         blocking_issues: preAnalysisGates.blocking_issues,
         warning_issues: preAnalysisGates.warning_issues,
       },
+      extraction_quality: extractionQuality,
+      extraction_provider: extractionProvider,
       can_proceed_to_analysis: preAnalysisGates.can_proceed_to_analysis,
       requires_human_review: requiresHumanReview,
       review_reason: reviewReason,
@@ -305,4 +402,76 @@ async function updateExtractionFailed(
       extraction_warnings: [errorMessage],
     })
     .eq('id', financialYearId);
+}
+
+function buildExtractionQuality(result: {
+  text: string;
+  pages: Array<{ tables?: unknown[]; blocks?: unknown[]; paragraphs?: unknown[] }>;
+}): {
+  pages: number;
+  text_length: number;
+  tables: number;
+  blocks: number;
+  paragraphs: number;
+  pcn_codes_found: number;
+  top_pcn_codes: Array<{ code: string; count: number }>;
+} {
+  const text = result.text || '';
+  const pages = result.pages || [];
+
+  const tables = pages.reduce((sum, page) => sum + (page.tables?.length || 0), 0);
+  const blocks = pages.reduce((sum, page) => sum + (page.blocks?.length || 0), 0);
+  const paragraphs = pages.reduce((sum, page) => sum + (page.paragraphs?.length || 0), 0);
+
+  const matches = text.match(/\b\d{4}\b/g) || [];
+  const counts: Record<string, number> = {};
+  for (const code of matches) {
+    counts[code] = (counts[code] || 0) + 1;
+  }
+
+  const topPcnCodes = Object.entries(counts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10)
+    .map(([code, count]) => ({ code, count }));
+
+  return {
+    pages: pages.length,
+    text_length: text.length,
+    tables,
+    blocks,
+    paragraphs,
+    pcn_codes_found: Object.keys(counts).length,
+    top_pcn_codes: topPcnCodes,
+  };
+}
+
+function shouldFallbackToAzure(quality: {
+  pages: number;
+  text_length: number;
+  tables: number;
+}): {
+  shouldFallback: boolean;
+  reasons: string[];
+} {
+  const reasons: string[] = [];
+
+  if (quality.pages === 0) {
+    reasons.push('0 pages detected');
+  }
+
+  if (quality.tables === 0) {
+    reasons.push('0 tables detected');
+  }
+
+  if (quality.pages > 0) {
+    const textPerPage = quality.text_length / quality.pages;
+    if (textPerPage < 200) {
+      reasons.push(`Low text density (${Math.round(textPerPage)} chars/page)`);
+    }
+  }
+
+  return {
+    shouldFallback: reasons.length > 0,
+    reasons,
+  };
 }
